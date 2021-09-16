@@ -18,6 +18,15 @@ from spnego._context import (
     wrap_system_error,
 )
 
+from spnego._credential import (
+    Credential,
+    CredentialCache,
+    KerberosCCache,
+    KerberosKeytab,
+    Password,
+    unify_credentials,
+)
+
 from spnego._text import (
     to_bytes,
     to_text,
@@ -29,6 +38,7 @@ from spnego.channel_bindings import (
 
 from spnego.exceptions import (
     GSSError as NativeError,
+    InvalidCredentialError,
     NegotiateOptions,
     SpnegoError,
 )
@@ -120,8 +130,7 @@ def _create_iov_result(iov: "IOV") -> typing.Tuple[IOVBuffer, ...]:
 def _get_gssapi_credential(
     mech: "gssapi.OID",
     usage: str,
-    username: typing.Optional[str] = None,
-    password: typing.Optional[str] = None,
+    credentials: typing.List[Credential],
     context_req: typing.Optional[ContextReq] = None,
 ) -> typing.Optional["gssapi.creds.Credentials"]:
     """Gets a set of credential(s).
@@ -149,8 +158,7 @@ def _get_gssapi_credential(
     Args:
         mech: The mech OID to get the credentials for.
         usage: Either `initiate` for a client context or `accept` for a server context.
-        username: The username to get the credentials for, if omitted then the default user is gotten from the cache.
-        password: The password for the user, if omitted then the cached credentials is retrieved.
+        credentials: List of credentials to retreive from.
         context_req: Context requirement flags that can control how the credential is retrieved.
 
     Returns:
@@ -159,39 +167,57 @@ def _get_gssapi_credential(
     .. _gss-ntlmssp:
         https://github.com/gssapi/gss-ntlmssp
     """
-    principal = None
-    if username:
-        name_type = getattr(gssapi.NameType, 'user' if usage == 'initiate' else 'hostbased_service')
-        principal = gssapi.Name(base=username, name_type=name_type)
+    kerberos_mech = gssapi.OID.from_int_seq(GSSMech.kerberos.value)
+    name_type = getattr(gssapi.NameType, 'user' if usage == 'initiate' else 'hostbased_service')
+    forwardable = bool(context_req and (context_req & ContextReq.delegate or context_req & ContextReq.delegate_policy))
 
-    if principal and password:
-        if usage == "initiate" and mech == gssapi.OID.from_int_seq(GSSMech.kerberos.value):
-            # GSSAPI offers no way to specify custom flags like forwardable when getting a Kerberos credential. This
-            # calls the Kerberos API to get the ticket and convert it to a GSSAPI credential.
-            forwardable = bool(
-                context_req and (context_req & ContextReq.delegate or context_req & ContextReq.delegate_policy)
-            )
-            cred = _kinit(to_bytes(username), to_bytes(password), forwardable=forwardable)
+    for cred in credentials:
+        if isinstance(cred, Password):
+            principal = gssapi.Name(base=cred.username, name_type=name_type)
+
+            if usage == "initiate" and mech == gssapi.OID.from_int_seq(GSSMech.kerberos.value):
+                # GSSAPI offers no way to specify custom flags like forwardable when getting a Kerberos credential. This
+                # calls the Kerberos API to get the ticket and convert it to a GSSAPI credential.
+                cred = _kinit(to_bytes(cred.username), to_bytes(cred.password), forwardable=forwardable)
+
+            else:
+                # MIT krb5 < 1.14 would store the kerb cred in the global cache but later versions used a private cache in
+                # memory. There's not much we can do about this but document this behaviour and hope people upgrade to a
+                # newer version.
+                cred = acquire_cred_with_password(principal, to_bytes(cred.password), usage=usage, mechs=[mech]).creds
+
+        elif isinstance(cred, KerberosKeytab):
+            if mech != kerberos_mech:
+                continue
+
+            principal = gssapi.Name(base=cred.principal, name_type=name_type)
+
+        elif isinstance(cred, KerberosCCache):
+            if mech != kerberos_mech:
+                continue
+
+            a = ""
+
+        elif isinstance(cred, CredentialCache):
+            if not cred.username:
+                # https://github.com/jborean93/pyspnego/issues/15
+                # Using None as a credential when creating the sec context is better than getting the default
+                # credential as the former takes into account the target SPN when selecting the principal to use.
+                return None
+
+            principal = gssapi.Name(base=cred.principal, name_type=name_type)
+            cred = gssapi.Credentials(name=principal, usage=usage, mechs=[mech])
+
+            # We don't need to check the actual lifetime, just trying to get the valid will have gssapi check the lifetime
+            # and raise an ExpiredCredentialsError if it is expired.
+            _ = cred.lifetime
+
+            return cred
+
         else:
-            # MIT krb5 < 1.14 would store the kerb cred in the global cache but later versions used a private cache in
-            # memory. There's not much we can do about this but document this behaviour and hope people upgrade to a
-            # newer version.
-            cred = acquire_cred_with_password(principal, to_bytes(password), usage=usage, mechs=[mech]).creds
+            raise InvalidCredentialError(context_msg="Unsupported credential specified")
 
-    elif principal or usage == 'accept':
-        cred = gssapi.Credentials(name=principal, usage=usage, mechs=[mech])
-
-        # We don't need to check the actual lifetime, just trying to get the valid will have gssapi check the lifetime
-        # and raise an ExpiredCredentialsError if it is expired.
-        _ = cred.lifetime
-
-    else:
-        # https://github.com/jborean93/pyspnego/issues/15
-        # Using None as a credential when creating the sec context is better than getting the default credential as the
-        # former takes into account the target SPN when selecting the principal to use.
-        cred = None
-
-    return cred
+    raise InvalidCredentialError(context_msg="No applicable credentials available")
 
 
 def _gss_ntlmssp_available(session_key: bool = False) -> bool:
@@ -247,7 +273,7 @@ def _gss_ntlmssp_available(session_key: bool = False) -> bool:
     try:
         # This can be anything, the first NTLM message doesn't need a valid target name or credential.
         spn = gssapi.Name('http@test', name_type=gssapi.NameType.hostbased_service)
-        cred = _get_gssapi_credential(ntlm, 'initiate', username='user', password='pass')
+        cred = _get_gssapi_credential(ntlm, 'initiate', [Password(username='user', password='pass')])
         context = gssapi.SecurityContext(creds=cred, usage='initiate', name=spn, mech=ntlm)
 
         context.step()  # Need to at least have a context set up before we can call gss_set_sec_context_option.
@@ -373,7 +399,7 @@ class GSSAPIProxy(ContextProxy):
     """
     def __init__(
         self,
-        username: typing.Optional[str] = None,
+        username: typing.Optional[typing.Union[str, Credential, typing.List[Credential]]],
         password: typing.Optional[str] = None,
         hostname: typing.Optional[str] = None,
         service: typing.Optional[str] = None,
@@ -388,7 +414,8 @@ class GSSAPIProxy(ContextProxy):
         if not HAS_GSSAPI:
             raise ImportError("GSSAPIProxy requires the Python gssapi library: %s" % GSSAPI_IMP_ERR)
 
-        super(GSSAPIProxy, self).__init__(username, password, hostname, service, channel_bindings, context_req, usage,
+        credentials = unify_credentials(username, password)
+        super(GSSAPIProxy, self).__init__(credentials, hostname, service, channel_bindings, context_req, usage,
                                           protocol, options, _is_wrapped)
 
         mech_str = {
@@ -400,8 +427,7 @@ class GSSAPIProxy(ContextProxy):
 
         cred = None
         try:
-            cred = _get_gssapi_credential(mech, self.usage, username=username, password=password,
-                                          context_req=context_req)
+            cred = _get_gssapi_credential(mech, self.usage, credentials=credentials, context_req=context_req)
         except GSSError as gss_err:
             raise SpnegoError(base_error=gss_err, context_msg="Getting GSSAPI credential") from gss_err
 

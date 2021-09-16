@@ -21,6 +21,10 @@ from spnego.iov import (
     IOVBuffer,
 )
 
+from spnego._credential import (
+    Credential,
+)
+
 from spnego._text import (
     to_text,
 )
@@ -219,8 +223,7 @@ class ContextProxy(metaclass=abc.ABCMeta):
     calls to what is required internally.
 
     Args:
-        username: The username to authenticate with. Certain providers can use a cache if omitted.
-        password: The password to authenticate with. Certain providers can use a cache if omitted.
+        credentials: A list of credentials to use for authentication.
         hostname: The principal part of the SPN. This is required for Kerberos auth to build the SPN.
         service: The service part of the SPN. This is required for Kerberos auth to build the SPN.
         channel_bindings: The optional :class:`spnego.channel_bindings.GssChannelBindings` for the context.
@@ -234,6 +237,7 @@ class ContextProxy(metaclass=abc.ABCMeta):
     Attributes:
         usage (str): The usage of the context, `initiate` for a client and `accept` for a server.
         protocol (str): The protocol to set the context up with; `ntlm`, `kerberos`, or `negotiate`.
+        credentials (List[Credential]): List of credentials that is used for authentication.
         username (str): The username.
         password (str): The password for username.
         spn (str): The service principal name of the service to connect to.
@@ -245,8 +249,7 @@ class ContextProxy(metaclass=abc.ABCMeta):
 
     def __init__(
         self,
-        username: typing.Optional[str],
-        password: typing.Optional[str],
+        credentials: typing.List[Credential],
         hostname: typing.Optional[str],
         service: typing.Optional[str],
         channel_bindings: typing.Optional[GssChannelBindings],
@@ -267,8 +270,10 @@ class ContextProxy(metaclass=abc.ABCMeta):
         if self.protocol not in self.available_protocols(options=options):
             raise ValueError("Protocol %s is not available" % self.protocol)
 
-        self.username = to_text(username, nonstring='passthru')
-        self.password = to_text(password, nonstring='passthru')
+        self.credentials = credentials
+        # FIXME: Set but add deprecation warning
+        # self.username = to_text(username, nonstring='passthru')
+        # self.password = to_text(password, nonstring='passthru')
 
         self.spn = None
         if service or hostname:

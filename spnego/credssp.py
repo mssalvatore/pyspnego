@@ -17,6 +17,7 @@ import spnego
 import ssl
 import struct
 import tempfile
+import typing
 
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes
@@ -31,6 +32,11 @@ from spnego._context import (
     UnwrapResult,
     WinRMWrapResult,
     WrapResult,
+)
+
+from spnego._credential import (
+    Password,
+    unify_credentials,
 )
 
 from spnego._credssp_structures import (
@@ -51,6 +57,7 @@ from spnego.exceptions import (
     FeatureMissingError,
     NativeError,
     NegotiateOptions,
+    NoCredentialError,
     OperationNotAvailableError,
     SpnegoError,
 )
@@ -296,7 +303,8 @@ class CredSSPProxy(ContextProxy):
     """
     def __init__(self, username, password, hostname=None, service=None, channel_bindings=None,
                  context_req=ContextReq.default, usage='initiate', protocol='credssp', options=0):
-        super(CredSSPProxy, self).__init__(username, password, hostname, service, channel_bindings, context_req, usage,
+        credentials = unify_credentials(username, password, required_protocol="credssp")
+        super(CredSSPProxy, self).__init__(credentials, hostname, service, channel_bindings, context_req, usage,
                                            protocol, options, False)
 
         if options & NegotiateOptions.session_key:
@@ -307,7 +315,7 @@ class CredSSPProxy(ContextProxy):
         self._options = options & ~NegotiateOptions.wrapping_winrm  # WinRM wrapping won't apply for auth context.
 
         self._auth_context = None
-        self._client_credential = None
+        self._ts_credential: typing.Optional[TSCredentials] = None
         self._complete = False
         self._step_gen = None
 
@@ -315,6 +323,19 @@ class CredSSPProxy(ContextProxy):
         self._out_buff = ssl.MemoryBIO()
         ctx, self._public_key = _create_tls_context(usage, options)
         self._tls_context = ctx.wrap_bio(self._in_buff, self._out_buff, server_side=(usage == 'accept'))
+
+        if usage == "initiate":
+            password_cred = None
+            for cred in credentials:
+                if isinstance(cred, Password):
+                    domain, username = split_username(cred.username)
+                    password_cred = TSPasswordCreds(domain or "", username, cred.password)
+                    break
+
+            if not password_cred:
+                raise NoCredentialError(context_msg="CredSSP requires a Password credential")
+
+            self._ts_credential = TSCredentials(credentials=password_cred)
 
     @classmethod
     def available_protocols(cls, options=None):
@@ -330,7 +351,10 @@ class CredSSPProxy(ContextProxy):
 
     @property
     def client_credential(self):
-        return self._client_credential
+        if self._ts_credential and self.usage == "accept":
+            return self._ts_credential.credentials
+        else:
+            return None
 
     @property
     def complete(self):
@@ -370,8 +394,8 @@ class CredSSPProxy(ContextProxy):
                                                           serialization.PublicFormat.PKCS1)
 
         log.debug("Starting CredSSP authentication phase")
-        self._auth_context = spnego.client(self.username, self.password, hostname=self._hostname,
-                                           service=self._service, protocol='negotiate', options=self._options)
+        self._auth_context = spnego.client(self.credentials, hostname=self._hostname, service=self._service,
+                                           protocol='negotiate', options=self._options)
 
         round = 0
         out_token = self._auth_context.step()
@@ -410,10 +434,7 @@ class CredSSPProxy(ContextProxy):
         if expected_key != response_key:
             raise BadBindingsError(context_msg="Public key verification failed, potential man in the middle attack")
 
-        domain, username = split_username(self.username)
-        ts_password = TSPasswordCreds(domain or u'', username, self.password)
-        enc_credentials = self._auth_context.wrap(TSCredentials(ts_password).pack()).data
-
+        enc_credentials = self._auth_context.wrap(self._ts_credential.pack()).data
         credential_request = TSRequest(_CREDSSP_VERSION, auth_info=enc_credentials)
         self._complete = True
 
@@ -471,8 +492,7 @@ class CredSSPProxy(ContextProxy):
         if not auth_request.auth_info:
             raise InvalidTokenError(context_msg="No credential received on CredSSP TSRequest from initiator")
 
-        credential = TSCredentials.unpack(self._auth_context.unwrap(auth_request.auth_info).data)
-        self._client_credential = credential.credentials
+        self._ts_credential = TSCredentials.unpack(self._auth_context.unwrap(auth_request.auth_info).data)
         self._complete = True
 
     def _step_tls(self, in_token):

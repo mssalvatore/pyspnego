@@ -10,6 +10,15 @@ from spnego._context import (
     ContextReq,
 )
 
+from spnego._credential import (
+    Credential,
+    CredentialCache,
+    KerberosCCache,
+    KerberosKeytab,
+    NTLMHash,
+    Password,
+)
+
 from spnego.auth import (
     client,
     server,
@@ -21,18 +30,16 @@ from spnego.exceptions import (
 
 __all__ = [
     'ContextReq',
+    'Credential',
+    'CredentialCache',
+    'KerberosCCache',
+    'KerberosKeytab',
+    'NegotiateOptions',
+    'NTLMHash',
+    'Password',
     'client',
     'server',
-    'NegotiateOptions',
 ]
-
-
-try:
-    from logging import NullHandler
-except ImportError:  # pragma: no cover
-    class NullHandler(logging.Handler):
-        def emit(self, record):
-            pass
 
 
 def _setup_logging(logger):
@@ -46,7 +53,7 @@ def _setup_logging(logger):
         logging.config.dictConfig(config)
     else:
         # no logging was provided
-        logger.addHandler(NullHandler())
+        logger.addHandler(logging.NullHandler())
 
 
 logger = logging.getLogger(__name__)
